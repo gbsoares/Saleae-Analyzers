@@ -1,0 +1,13 @@
+{
+  "name": "SLIP (IP/TCP)",
+  "apiVersion": "1.0.0",
+  "author": "Gabriel Bevilacqua Soares",
+  "version": "0.0.1",
+  "description": "A High Level Analyzer for SLIP (Serial Line Internet Protocol)",
+  "extensions": {
+    "SLIP": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.Hla"
+    }
+  }
+}
