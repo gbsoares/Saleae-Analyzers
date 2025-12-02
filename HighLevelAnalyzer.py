@@ -16,6 +16,12 @@ ESC = 0xDB  # SLIP ESC
 ESC_END = 0xDC
 ESC_ESC = 0xDD
 
+PROTOCOL_NAMES = {
+    1: 'ICMP',
+    6: 'TCP',
+    17: 'UDP',
+}
+
 
 class Hla(HighLevelAnalyzer):
     """
@@ -28,6 +34,8 @@ class Hla(HighLevelAnalyzer):
     Output frames (UI-safe primitive types):
       - 'slip_packet': a decoded SLIP packet
       - 'slip_error' : error in SLIP stream (bad escape, etc)
+      - 'ipv4_packet': decoded IPv4 packet inside SLIP
+      - 'ipv4_error' : error decoding IPv4 packet
     """
 
     # What shows up in the bubble text / data table.
@@ -38,6 +46,12 @@ class Hla(HighLevelAnalyzer):
         },
         'slip_error': {
             'format': 'SLIP ERROR: {{data.message}} (byte=0x{{data.byte:02X}})'
+        },
+        'ipv4_packet': {
+            'format': 'IPv4 [{{data.src}} -> {{data.dst}} {{data.protocol}} len={{data.total_length}}{{data.ports}}]'
+        },
+        'ipv4_error': {
+            'format': 'IPv4 ERROR: {{data.message}}'
         },
     }
 
@@ -83,6 +97,86 @@ class Hla(HighLevelAnalyzer):
         )
 
         return f
+
+    def _parse_ipv4(self, payload):
+        """
+        Decode the IPv4 header from the given payload.
+
+        Returns (data_dict, error_str). If decoding fails, data_dict is None and
+        error_str contains a human-readable message.
+        """
+        if len(payload) < 20:
+            return None, 'Too short for IPv4 header'
+
+        version_ihl = payload[0]
+        version = version_ihl >> 4
+        ihl = version_ihl & 0x0F
+
+        if version != 4:
+            return None, f'Unsupported IP version {version}'
+
+        header_length = ihl * 4
+        if ihl < 5:
+            return None, f'Invalid IHL (too small): {ihl}'
+        if len(payload) < header_length:
+            return None, f'Truncated IPv4 header (need {header_length}, have {len(payload)})'
+
+        total_length = (payload[2] << 8) | payload[3]
+        if total_length < header_length:
+            return None, f'Total length smaller than header ({total_length} < {header_length})'
+        if len(payload) < total_length:
+            return None, f'Truncated IPv4 packet (total_length={total_length}, have {len(payload)})'
+
+        src = '.'.join(str(b) for b in payload[12:16])
+        dst = '.'.join(str(b) for b in payload[16:20])
+        protocol_num = payload[9]
+        protocol_name = PROTOCOL_NAMES.get(protocol_num, f'Proto {protocol_num}')
+
+        ports = ''
+        if protocol_num in (6, 17) and len(payload) >= header_length + 4:
+            src_port = (payload[header_length] << 8) | payload[header_length + 1]
+            dst_port = (payload[header_length + 2] << 8) | payload[header_length + 3]
+            ports = f' {src_port} -> {dst_port}'
+
+        data = {
+            'src': src,
+            'dst': dst,
+            'protocol': protocol_name,
+            'total_length': str(total_length),
+            'header_length': str(header_length),
+            'payload_length': str(total_length - header_length),
+            'ports': ports,
+        }
+
+        return data, None
+
+    def _emit_ipv4_frame(self, start_time, end_time):
+        """Create an AnalyzerFrame for the decoded IPv4 packet."""
+        if not self.buffer:
+            return None
+
+        parsed, error = self._parse_ipv4(self.buffer)
+        start = start_time if start_time else (self.frame_start_time if self.frame_start_time else end_time)
+
+        if error:
+            return AnalyzerFrame(
+                'ipv4_error',
+                start,
+                end_time,
+                {
+                    'message': error,
+                }
+            )
+
+        if not parsed:
+            return None
+
+        return AnalyzerFrame(
+            'ipv4_packet',
+            start,
+            end_time,
+            parsed
+        )
 
     def _emit_error_frame(self, end_time, message, offending_byte):
         """Create an AnalyzerFrame for an error in the SLIP stream."""
@@ -147,9 +241,18 @@ class Hla(HighLevelAnalyzer):
 
             if byte_val == END:
                 # END marks the end of the current SLIP packet
-                packet = self._emit_packet_frame(byte_end)
-                if packet:
-                    out_frames.append(packet)
+                packet_start = self.frame_start_time if self.frame_start_time else byte_end
+                
+                # Try to decode as IPv4; if that fails, emit the raw SLIP packet
+                ipv4_frame = self._emit_ipv4_frame(packet_start, byte_end)
+                if ipv4_frame:
+                    out_frames.append(ipv4_frame)
+                else:
+                    # No valid IPv4, emit raw SLIP packet
+                    packet = self._emit_packet_frame(byte_end)
+                    if packet:
+                        out_frames.append(packet)
+                
                 # Clear state and wait for the next packet (also handles empty packets)
                 self._reset_state()
                 continue
