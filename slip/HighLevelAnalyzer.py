@@ -133,10 +133,27 @@ class Hla(HighLevelAnalyzer):
         protocol_name = PROTOCOL_NAMES.get(protocol_num, f'Proto {protocol_num}')
 
         ports = ''
+        src_port = None
+        dst_port = None
+        transport_payload = None
+        
         if protocol_num in (6, 17) and len(payload) >= header_length + 4:
             src_port = (payload[header_length] << 8) | payload[header_length + 1]
             dst_port = (payload[header_length + 2] << 8) | payload[header_length + 3]
             ports = f' {src_port} -> {dst_port}'
+            
+            # Extract transport layer payload (after TCP/UDP header)
+            # TCP header is variable (min 20 bytes), UDP header is 8 bytes
+            if protocol_num == 17:  # UDP
+                udp_length = (payload[header_length + 4] << 8) | payload[header_length + 5]
+                transport_header_len = 8
+                if len(payload) >= header_length + transport_header_len:
+                    transport_payload = payload[header_length + transport_header_len:header_length + udp_length]
+            elif protocol_num == 6:  # TCP
+                if len(payload) >= header_length + 12:
+                    tcp_data_offset = (payload[header_length + 12] >> 4) * 4
+                    if len(payload) >= header_length + tcp_data_offset:
+                        transport_payload = payload[header_length + tcp_data_offset:total_length]
 
         data = {
             'src': src,
@@ -145,10 +162,27 @@ class Hla(HighLevelAnalyzer):
             'total_length': str(total_length),
             'header_length': str(header_length),
             'payload_length': str(total_length - header_length),
-            'ports': ports,
+            'ports': f' {src_port} -> {dst_port}' if src_port and dst_port else '',
+            'transport_payload': str(transport_payload) if transport_payload else '',
         }
 
         return data, None
+
+    def _print_transport_payload(self, parsed):
+        """Print UDP/TCP payload to terminal."""
+                
+        src_ip = parsed.get('src')
+        dst_ip = parsed.get('dst')
+        src_port = parsed.get('ports').split(' -> ')[0].strip() if parsed.get('ports') else None
+        dst_port = parsed.get('ports').split(' -> ')[1].strip() if parsed.get('ports') else None
+        transport_payload = parsed.get('transport_payload')
+        protocol_name = parsed.get('protocol')
+        payload_length = parsed.get('payload_length')
+
+        if not transport_payload or not src_port or not dst_port:
+            return
+                
+        print(f"{src_ip}:{src_port} -> {dst_ip}:{dst_port} - {protocol_name} ({payload_length}): {transport_payload}")
 
     def _emit_ipv4_frame(self, start_time, end_time):
         """Create an AnalyzerFrame for the decoded IPv4 packet."""
@@ -170,6 +204,9 @@ class Hla(HighLevelAnalyzer):
 
         if not parsed:
             return None
+        
+        # Print UDP/TCP payload to terminal
+        self._print_transport_payload(parsed)
 
         return AnalyzerFrame(
             'ipv4_packet',
@@ -202,6 +239,7 @@ class Hla(HighLevelAnalyzer):
           - Return a single frame    -> AnalyzerFrame(...)
           - Return a list of frames  -> [AnalyzerFrame(...), ...]
         """
+        # Debug: Print all public methods and attributes of the frame object
         # We only care about data frames from Async Serial.
         # Skip error frames (framing errors, parity errors, etc.)
         if frame.type != 'data':
